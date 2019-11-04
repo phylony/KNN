@@ -23,7 +23,6 @@
 // Modifed 2019 Arthur Brussee
 
 using System;
-using System.Diagnostics;
 using KNN.Internal;
 using KNN.Jobs;
 using Unity.Collections;
@@ -32,8 +31,8 @@ using Unity.Jobs;
 using Unity.Mathematics;
 
 namespace KNN {
-	[NativeContainerSupportsDeallocateOnJobCompletion, NativeContainer, DebuggerDisplay("Length = {Points.Length}")]
-	public struct KnnContainer {
+	[NativeContainerSupportsDeallocateOnJobCompletion, NativeContainer, System.Diagnostics.DebuggerDisplay("Length = {Points.Length}")]
+	public struct KnnContainer : IDisposable {
 		// We manage safety by our own sentinel. Disable unity's safety system for internal caches / arrays
 		[NativeDisableContainerSafetyRestriction]
 		public NativeArray<float3> Points;
@@ -54,8 +53,10 @@ namespace KNN {
 
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
 		// Note: MUST be named m_Safey, m_DisposeSentinel exactly
+		// ReSharper disable once InconsistentNaming
 		internal AtomicSafetyHandle m_Safety;
 		[NativeSetClassTypeToNullOnSchedule]
+		// ReSharper disable once InconsistentNaming
 		internal DisposeSentinel m_DisposeSentinel;
 #endif
 
@@ -68,7 +69,13 @@ namespace KNN {
 			public static KnnQueryTemp Create(int k) {
 				KnnQueryTemp temp;
 				temp.Heap = new KSmallestHeap(k, Allocator.Temp);
-				temp.MinHeap = new MinHeap(k * 4, Allocator.Temp);
+				
+				// Min heap keeps track of current stack.
+				// The max stack depth is the tree depth
+				// The tree depth is log_c(nodes)
+				// Let's assume people have a tree at most 32 deep (which equals 2^32 * c_maxPointsPerLeafNode ~ 2^39 nodes)
+				// There are left/right nodes -> 64 max on stack at any given time
+				temp.MinHeap = new MinHeap(64, Allocator.Temp);
 				return temp;
 			}
 		}
@@ -103,7 +110,6 @@ namespace KNN {
 			}
 		}
 
-		// TODO: Really want to make this a burst delegate!
 		public void Rebuild() {
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
 			AtomicSafetyHandle.CheckWriteAndThrow(m_Safety);
@@ -277,8 +283,8 @@ namespace KNN {
 		/// <summary>
 		/// Recursive splitting procedure
 		/// </summary>
-		unsafe void SplitNode(int parentIndex, out int posNodeIndex, out int negNodeIndex) {
-			ref KdNode parent = ref UnsafeUtilityEx.ArrayElementAsRef<KdNode>(m_nodes.GetUnsafePtr(), parentIndex);
+		void SplitNode(int parentIndex, out int posNodeIndex, out int negNodeIndex) {
+			KdNode parent = m_nodes[parentIndex];
 
 			// center of bounding box
 			KdNodeBounds parentBounds = parent.Bounds;
@@ -304,9 +310,6 @@ namespace KNN {
 			// Calculate the spiting coords
 			float splitPivot = CalculatePivot(parent.Start, parent.End, boundsStart, boundsEnd, splitAxis);
 
-			parent.PartitionAxis = splitAxis;
-			parent.PartitionCoordinate = splitPivot;
-
 			// 'Spiting' array to two sub arrays
 			int splittingIndex = Partition(parent.Start, parent.End, splitPivot, splitAxis);
 
@@ -318,6 +321,9 @@ namespace KNN {
 			bounds.Max = negMax;
 			negNodeIndex = GetKdNode(bounds, parent.Start, splittingIndex);
 
+			parent.PartitionAxis = splitAxis;
+			parent.PartitionCoordinate = splitPivot;
+			
 			// Positive / Right node
 			float3 posMin = parentBounds.Min;
 			posMin[splitAxis] = splitPivot;
@@ -328,6 +334,9 @@ namespace KNN {
 
 			parent.NegativeChildIndex = negNodeIndex;
 			parent.PositiveChildIndex = posNodeIndex;
+
+			// Write back node to array to update those values
+			m_nodes[parentIndex] = parent;
 		}
 
 		/// <summary>
@@ -436,16 +445,16 @@ namespace KNN {
 		
 		void PushToHeap(int nodeIndex, float3 tempClosestPoint, float3 queryPosition, ref KnnQueryTemp temp) {
 			float sqrDist = math.lengthsq(tempClosestPoint - queryPosition);
-
-			KdQueryNode queryNode;
-			queryNode.NodeIndex = nodeIndex;
-			queryNode.TempClosestPoint = tempClosestPoint;
-			queryNode.Distance = sqrDist;
+			
+			KdQueryNode queryNode = new KdQueryNode {
+				NodeIndex = nodeIndex,
+				TempClosestPoint = tempClosestPoint,
+				Distance = sqrDist
+			};
 
 			temp.MinHeap.PushObj(queryNode, sqrDist);
 		}
 
-		// TODO: really want to make this a burst-compiled delegate!
 		public void KNearest(float3 queryPosition, NativeSlice<int> result) {
 #if ENABLE_UNITY_COLLECTIONS_CHECKS
 			AtomicSafetyHandle.CheckReadAndThrow(m_Safety);
@@ -477,7 +486,7 @@ namespace KNN {
 					continue;
 				}
 
-				ref var node = ref UnsafeUtilityEx.ArrayElementAsRef<KdNode>(nodePtr, queryNode.NodeIndex);
+				ref KdNode node = ref UnsafeUtilityEx.ArrayElementAsRef<KdNode>(nodePtr, queryNode.NodeIndex);
 
 				if (!node.Leaf) {
 					int partitionAxis = node.PartitionAxis;
@@ -493,7 +502,7 @@ namespace KNN {
 						// project the tempClosestPoint to other bound
 						tempClosestPoint[partitionAxis] = partitionCoord;
 
-						if (UnsafeUtilityEx.ArrayElementAsRef<KdNode>(nodePtr, queryNode.NodeIndex).Count != 0) {
+						if (node.Count != 0) {
 							PushToHeap(node.PositiveChildIndex, tempClosestPoint, queryPosition, ref temp);
 						}
 					} else {
@@ -505,7 +514,7 @@ namespace KNN {
 						// project the tempClosestPoint to other bound
 						tempClosestPoint[partitionAxis] = partitionCoord;
 
-						if (UnsafeUtilityEx.ArrayElementAsRef<KdNode>(nodePtr, queryNode.NodeIndex).Count != 0) {
+						if (node.Count != 0) {
 							PushToHeap(node.NegativeChildIndex, tempClosestPoint, queryPosition, ref temp);
 						}
 					}
@@ -526,6 +535,7 @@ namespace KNN {
 			}
 
 			int retCount = result.Length + 1;
+			
 			for (int i = 1; i < retCount; i++) {
 				result[i - 1] = temp.Heap.PopObj();
 			}
